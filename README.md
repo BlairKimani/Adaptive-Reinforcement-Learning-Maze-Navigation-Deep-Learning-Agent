@@ -44,3 +44,8 @@ Built with Python 3.11+, Pygame, TensorFlow/Keras, and NumPy — two source
 files (`Game.py` for environment, camera, UI, and training orchestration;
 `model.py` for the network and gradient update), plus automatically created
 directories for models, maps, paths, and logs. Run it with `python Game.py`.
+
+<img width="1280" height="600" alt="Screenshot 2026-11-14 213141" src="https://github.com/user-attachments/assets/980027b3-3795-4b31-b613-7a83a88b2bcc" />
+
+<img width="1278" height="597" alt="Screenshot 2026-11-14 213113" src="https://github.com/user-attachments/assets/c58f0475-f422-4de0-9ba2-27157d644047" />
+
