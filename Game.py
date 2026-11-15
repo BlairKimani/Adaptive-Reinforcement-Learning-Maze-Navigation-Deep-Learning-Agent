@@ -5,8 +5,8 @@ Scalable 2D maze navigation game with reinforcement learning (REINFORCE),
 an independent 2D camera, minimap, path persistence, and a training dashboard.
 
 Controls:
-    F        toggle follow-agent camera
-    WASD / arrows  pan camera (free mode)
+    F              toggle follow-agent camera
+    WASD           pan camera (free mode)
     Mouse drag     pan camera
     Mouse wheel    zoom (viewport) / scroll (dashboard)
     SPACE          centre camera on agent
@@ -20,7 +20,15 @@ Controls:
     L              load model
     V              toggle path overlay
     1/2/3          simulation speed (1x, 4x, 16x)
+    X              toggle user-control of the agent
+    Arrow keys     control the agent when user-control is ON
     ESC            exit edit mode (or quit)
+
+When user-control is ON the agent renders in sky blue; when OFF it renders
+in its original accent colour.  Rewards, trajectory recording, and policy
+updates all use the exact same pipeline as before — actions chosen by the
+user are still pushed through MazeEnv.step() and, in training mode, are
+learned from just like actions sampled from the policy.
 """
 
 from __future__ import annotations
@@ -97,7 +105,8 @@ COLORS = {
     "cell":          (35, 38, 48),
     "wall":          (70, 75, 95),
     "grid":          (28, 30, 38),
-    "agent":         (80, 200, 255),
+    "agent":         (80, 200, 255),      # original accent colour
+    "agent_user":    (135, 220, 255),     # sky blue when user is in control
     "start":         (90, 220, 120),
     "goal":          (255, 180, 60),
     "visited":       (50, 60, 85),
@@ -655,16 +664,8 @@ class PathManager:
 # UI helpers
 # --------------------------------------------------------------------------- #
 class TextInput:
-    """
-    Single-line text input.
-
-    Fix: hit-testing must account for the content surface being scrolled,
-    so we track a *screen rect* each frame (set by the dashboard builder)
-    and compare against real screen coordinates.
-    """
-
     def __init__(self, initial=""):
-        self.rect = pygame.Rect(0, 0, 0, 0)     # screen-space rect (updated per frame)
+        self.rect = pygame.Rect(0, 0, 0, 0)
         self.text = str(initial)
         self.active = False
         self.blink = 0.0
@@ -703,21 +704,13 @@ class TextInput:
 
 
 class Dropdown:
-    """
-    Dropdown drawn *above* the dashboard content so its list is not clipped
-    by the scrolled content surface.
-
-    Fix: we split 'draw the closed box' (inside dashboard content) from
-    'draw the open list' (as a top-level overlay after everything else).
-    """
-
     def __init__(self, items, font):
         self.items = list(items)
         self.font = font
         self.open = False
         self.selected_index = 0 if self.items else -1
-        self.box_rect = pygame.Rect(0, 0, 0, 0)     # screen-space (updated per frame)
-        self.item_rects = []                         # screen-space when open
+        self.box_rect = pygame.Rect(0, 0, 0, 0)
+        self.item_rects = []
 
     @property
     def selected(self):
@@ -755,7 +748,6 @@ class Dropdown:
                             [(ax - 5, ay - 3), (ax + 5, ay - 3), (ax, ay + 3)])
 
     def draw_list(self, screen, max_visible=8):
-        """Draw the open list on the real screen (overlay, not scrolled)."""
         if not self.open or not self.items:
             self.item_rects = []
             return
@@ -829,6 +821,10 @@ class Game:
         self.ep_rewards = []
         self.input_history: List[np.ndarray] = []
 
+        # User control of the agent
+        self.user_control = False
+        self._arrow_keys = [False, False, False, False]  # up, right, down, left
+
         # Camera & UI
         self.camera = Camera(view_w=WINDOW_W - DASHBOARD_W, view_h=WINDOW_H)
         self.show_minimap = True
@@ -838,7 +834,7 @@ class Game:
 
         # Map editing
         self.edit_mode = False
-        self.edit_brush = "wall"    # "wall" | "erase" | "start" | "goal"
+        self.edit_brush = "wall"
         self._edit_dragging = False
         self._edit_last_cell = None
 
@@ -925,7 +921,6 @@ class Game:
         self.flash(f"New random map '{self.map_id}'")
 
     def new_custom_map(self):
-        """Create a fully-open grid so the user can paint walls."""
         try:
             w = int(self.input_width.text)
             h = int(self.input_height.text)
@@ -941,7 +936,7 @@ class Game:
             self.flash("Seed must be an integer")
             return
 
-        grid = np.zeros((h, w), dtype=np.uint8)      # all empty
+        grid = np.zeros((h, w), dtype=np.uint8)
         start = (0, 0)
         goal = (h - 1, w - 1)
         gen = MazeGenerator(seed=seed)
@@ -966,7 +961,6 @@ class Game:
         self._reset_episode_buffers()
         self._center_camera_on_agent()
 
-        # Enter edit mode immediately with "wall" brush
         self.edit_mode = True
         self.edit_brush = "wall"
         self.flash("Custom map — paint walls, set start/goal, then Save")
@@ -988,7 +982,6 @@ class Game:
     def save_current_map(self):
         try:
             if self.edit_mode:
-                # Commit current grid edits
                 self.env.refresh_distances()
             cfg = self.map_config_from_env()
             save_map(cfg, self.map_id)
@@ -1031,6 +1024,7 @@ class Game:
         self.input_history = [self.state.copy()]
         self.last_action_label = "-"
         self.episode_success = False
+        self._arrow_keys = [False, False, False, False]
 
     def _on_reset_button(self):
         if pygame.key.get_mods() & pygame.KMOD_SHIFT:
@@ -1067,20 +1061,69 @@ class Game:
         self._reset_episode_buffers()
         self.flash(("Evaluation" if self.evaluation else "Idle") + " mode")
 
+    def toggle_user_control(self):
+        self.user_control = not self.user_control
+        self._arrow_keys = [False, False, False, False]
+        self.flash(
+            f"User control {'ON' if self.user_control else 'OFF'}"
+            + (" — use arrow keys to move" if self.user_control else "")
+        )
+
+    def _action_from_user(self) -> Optional[int]:
+        """Map the held arrow keys to an action.
+
+        Return ``None`` if no arrow key was pressed this frame, so the caller
+        can skip stepping the environment.  The user-facing keys map onto the
+        relative-action space as follows:
+
+            Up    -> Forward
+            Right -> Right
+            Down  -> Backward
+            Left  -> Left
+        """
+        up, right, down, left = self._arrow_keys
+        if up:    return 0
+        if right: return 1
+        if down:  return 2
+        if left:  return 3
+        return None
+
     def step_env(self):
-        self.last_probs = rl_model.action_probabilities(self.model, self.state)
-        if self.training:
-            action = rl_model.sample_action(self.last_probs, self.rng)
-        elif self.evaluation:
-            action = (rl_model.greedy_action(self.last_probs)
-                      if self.eval_greedy
-                      else rl_model.sample_action(self.last_probs, self.rng))
+        # --------------------------------------------------------------- #
+        # Choose the action.  Priority:
+        #   1. User control (arrow keys) — wins over everything else
+        #   2. Training mode    (stochastic)
+        #   3. Evaluation mode  (greedy or stochastic)
+        #   4. Idle              (greedy)
+        # --------------------------------------------------------------- #
+        if self.user_control:
+            action = self._action_from_user()
+            if action is None:
+                return False  # nothing to do this frame
+            # Refresh probabilities for display purposes so the dashboard
+            # shows what the policy *would* have done at this state.
+            self.last_probs = rl_model.action_probabilities(self.model, self.state)
         else:
-            action = rl_model.greedy_action(self.last_probs)
+            self.last_probs = rl_model.action_probabilities(self.model, self.state)
+            if self.training:
+                action = rl_model.sample_action(self.last_probs, self.rng)
+            elif self.evaluation:
+                action = (rl_model.greedy_action(self.last_probs)
+                          if self.eval_greedy
+                          else rl_model.sample_action(self.last_probs, self.rng))
+            else:
+                action = rl_model.greedy_action(self.last_probs)
 
         self.last_action = action
         self.last_action_label = ["Fwd", "Right", "Bwd", "Left"][action]
+        if self.user_control:
+            self.last_action_label += " (user)"
 
+        # The record-pipeline is *identical* whether the action came from the
+        # policy or from the user: states, actions, rewards, and gradients
+        # all flow through the same code.  This is the whole point of the
+        # feature — the user is effectively providing expert demonstrations
+        # to the REINFORCE update.
         self.ep_states.append(self.state.copy())
         self.ep_actions.append(action)
 
@@ -1158,6 +1201,16 @@ class Game:
     # Events
     # ------------------------------------------------------------------ #
     def _handle_events(self, dt):
+        # Track held arrow keys each frame for user-control movement.
+        keys = pygame.key.get_pressed()
+        if self.user_control:
+            self._arrow_keys = [
+                keys[pygame.K_UP],
+                keys[pygame.K_RIGHT],
+                keys[pygame.K_DOWN],
+                keys[pygame.K_LEFT],
+            ]
+
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 return False
@@ -1169,7 +1222,6 @@ class Game:
             widget_used |= self.input_seed.handle_event(e)
             widget_used |= self.map_dropdown.handle_event(e)
             if widget_used:
-                # If typing, swallow KEYDOWN
                 continue
 
             if e.type == pygame.KEYDOWN:
@@ -1178,6 +1230,11 @@ class Game:
                                    or self.input_height.active
                                    or self.input_seed.active)
                 if any_text_active:
+                    continue
+
+                # Arrow keys are reserved for user-control — swallow here.
+                if k in (pygame.K_UP, pygame.K_RIGHT,
+                         pygame.K_DOWN, pygame.K_LEFT):
                     continue
 
                 if k == pygame.K_ESCAPE:
@@ -1215,6 +1272,8 @@ class Game:
                 elif k == pygame.K_l:
                     ok = load_weights(self.model, self.optimizer)
                     self.flash("Model loaded" if ok else "No saved model found")
+                elif k == pygame.K_x:
+                    self.toggle_user_control()
                 elif k in (pygame.K_1, pygame.K_2, pygame.K_3):
                     self.speed = {pygame.K_1: 1, pygame.K_2: 4, pygame.K_3: 16}[k]
                     self.flash(f"Speed {self.speed}x")
@@ -1232,7 +1291,6 @@ class Game:
             if e.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = e.pos
 
-                # Dashboard buttons
                 if mx > WINDOW_W - DASHBOARD_W and e.button == 1:
                     for rect, cb in self._hit_buttons:
                         if rect.collidepoint(e.pos):
@@ -1240,13 +1298,11 @@ class Game:
                             break
                     continue
 
-                # Minimap
                 if self.show_minimap and self._minimap_rect().collidepoint(e.pos):
                     if e.button == 1:
                         self._minimap_click(e.pos)
                     continue
 
-                # Edit-mode painting
                 if self.edit_mode and mx <= WINDOW_W - DASHBOARD_W:
                     r, c = self._screen_to_cell(mx, my)
                     if 0 <= r < self.env.height and 0 <= c < self.env.width:
@@ -1258,7 +1314,6 @@ class Game:
                             self.env.grid[r, c] = 0
                     continue
 
-                # Camera drag
                 if e.button == 1:
                     self.dragging = True
                     self.drag_start = e.pos
@@ -1285,13 +1340,12 @@ class Game:
                         self.drag_start = e.pos
                         self.camera.follow = False
 
-        # WASD panning
-        keys = pygame.key.get_pressed()
+        # WASD panning — camera-only control now (arrows belong to the agent).
         pan = np.array([0.0, 0.0], dtype=np.float32)
-        if keys[pygame.K_a] or keys[pygame.K_LEFT]:  pan[0] -= 1
-        if keys[pygame.K_d] or keys[pygame.K_RIGHT]: pan[0] += 1
-        if keys[pygame.K_w] or keys[pygame.K_UP]:    pan[1] -= 1
-        if keys[pygame.K_s] or keys[pygame.K_DOWN]:  pan[1] += 1
+        if keys[pygame.K_a]: pan[0] -= 1
+        if keys[pygame.K_d]: pan[0] += 1
+        if keys[pygame.K_w]: pan[1] -= 1
+        if keys[pygame.K_s]: pan[1] += 1
         if pan.any():
             self.camera.pan(pan[0] * PAN_SPEED * dt, pan[1] * PAN_SPEED * dt)
             self.camera.follow = False
@@ -1328,7 +1382,11 @@ class Game:
         self.camera.clamp(self.env.width, self.env.height, CELL)
 
         if not self.paused and not self.edit_mode:
-            if self.training:
+            if self.user_control:
+                # User control is frame-rate based — one action per frame
+                # maximum so holding a key doesn't teleport the agent.
+                self.step_env()
+            elif self.training:
                 self.step_accum += dt * 20.0 * self.speed
                 n = int(self.step_accum); self.step_accum -= n
                 for _ in range(min(n, 64)):
@@ -1351,7 +1409,6 @@ class Game:
         self._draw_dashboard()
         if self.show_minimap:
             self._draw_minimap()
-        # Dropdown list is drawn AFTER dashboard, over everything
         self.map_dropdown.draw_list(self.screen)
         self._draw_toast()
 
@@ -1405,6 +1462,13 @@ class Game:
                 f"LMB=paint  RMB=erase  ESC=exit",
                 True, COLORS["good"])
             self.screen.blit(hint, (10, 10))
+        elif self.user_control:
+            pygame.draw.rect(self.screen, COLORS["agent_user"],
+                             (0, 0, WINDOW_W - DASHBOARD_W, WINDOW_H), 2)
+            hint = self.font_m.render(
+                "USER CONTROL  •  arrow keys to move  •  X to release",
+                True, COLORS["agent_user"])
+            self.screen.blit(hint, (10, 10))
 
     def _draw_marker(self, pos, color, z):
         r, c = pos
@@ -1417,7 +1481,8 @@ class Game:
         rect = self._cell_rect(self.env.agent_r, self.env.agent_c, z)
         cx, cy = rect.center
         radius = max(3, rect.w // 3)
-        pygame.draw.circle(self.screen, COLORS["agent"], (cx, cy), radius)
+        agent_color = COLORS["agent_user"] if self.user_control else COLORS["agent"]
+        pygame.draw.circle(self.screen, agent_color, (cx, cy), radius)
         dr, dc = DIR_VECTORS[self.env.orientation]
         pygame.draw.line(self.screen, (255, 255, 255), (cx, cy),
                         (cx + dc * radius, cy + dr * radius), 2)
@@ -1431,21 +1496,17 @@ class Game:
                 c * CELL + CELL / 2,
                 r * CELL + CELL / 2,
             )
-            # Skip non-finite points (NaN/inf) and clamp to a sane range
             if not (math.isfinite(sx) and math.isfinite(sy)):
                 continue
-            # Clamp to a bounded range to avoid overflow on extreme zooms
             sx = max(-100000.0, min(100000.0, sx))
             sy = max(-100000.0, min(100000.0, sy))
             pts.append((int(round(sx)), int(round(sy))))
 
         if len(pts) < 2:
             return
-
         try:
             pygame.draw.lines(self.screen, color, False, pts, max(1, width))
         except (TypeError, ValueError):
-            # Silently ignore draw errors so the app never crashes mid-frame
             pass
 
     # ------------------------------------------------------------------ #
@@ -1531,7 +1592,6 @@ class Game:
             surf.blit(self.font_s.render(label, True, COLORS["text"]), (x, y + 3))
             local = pygame.Rect(x + 90, y, DASHBOARD_W - 120, 22)
             widget.draw(surf, self.font_s, local)
-            # Sync widget's screen rect for hit-testing
             widget.rect = pygame.Rect(
                 local.x + (WINDOW_W - DASHBOARD_W),
                 local.y - int(self.dash_scroll),
@@ -1559,6 +1619,8 @@ class Game:
             mode += " (PAUSED)"; mcol = COLORS["bad"]
         if self.edit_mode:
             mode += "  [EDIT]"
+        if self.user_control:
+            mode += "  [USER]"; mcol = COLORS["agent_user"]
         text(mode, mcol, self.font_m)
         text(f"Speed: {self.speed}x  Follow: {self.camera.follow}  "
              f"Zoom: {self.camera.zoom:.2f}", COLORS["text_dim"])
@@ -1637,6 +1699,14 @@ class Game:
                       (gr.x + 4, gr.bottom - 16))
         y += gr.h + 8; line()
 
+        # user control toggle
+        text("Agent Control", COLORS["text"], self.font_m)
+        uc_label = (f"User Control: {'ON  (arrow keys)' if self.user_control else 'OFF  (policy)'}")
+        uc_col = COLORS["agent_user"] if self.user_control else COLORS["text_dim"]
+        text(uc_label, uc_col)
+        button(f"Toggle User Control  [X]", self.toggle_user_control)
+        y += 4; line()
+
         # custom map
         text("Custom Map", COLORS["text"], self.font_m)
         input_row("Width :", self.input_width)
@@ -1684,7 +1754,6 @@ class Game:
 
         button(f"Edit Mode: {'ON' if self.edit_mode else 'OFF'}", toggle_edit)
 
-        # brush buttons (2 per row)
         brush_labels = [("wall", "Paint Wall"), ("erase", "Erase Cell"),
                         ("start", "Move Start"), ("goal", "Move Goal")]
         bw = (DASHBOARD_W - 28 - 4) // 2
@@ -1727,7 +1796,9 @@ class Game:
             "K  save model        L load model",
             "F  follow agent      SPACE centre",
             "M  minimap   V paths  1/2/3 speed",
-            "WASD/arrows or drag = pan",
+            "X  toggle user control",
+            "Arrow keys = move agent (user ctl)",
+            "WASD  or drag = pan camera",
             "Mouse wheel = zoom (viewport)",
             "Mouse wheel = scroll (dashboard)",
             "",
@@ -1787,8 +1858,9 @@ class Game:
                 (int(off_x + (c + 0.5) * scale),
                  int(off_y + (r + 0.5) * scale)), 3)
 
+        agent_col = COLORS["agent_user"] if self.user_control else COLORS["agent"]
         pygame.draw.circle(
-            surf, COLORS["agent"],
+            surf, agent_col,
             (int(off_x + (self.env.agent_c + 0.5) * scale),
              int(off_y + (self.env.agent_r + 0.5) * scale)), 3)
 
